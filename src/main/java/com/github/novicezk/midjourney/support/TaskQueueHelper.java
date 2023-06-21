@@ -13,17 +13,16 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 @Slf4j
@@ -34,27 +33,19 @@ public class TaskQueueHelper {
 	@Resource
 	private NotifyService notifyService;
 
-	private final int timeoutMinutes;
 	private final ThreadPoolTaskExecutor taskExecutor;
-	private final ThreadPoolTaskExecutor waitFutureExecutor;
 	private final List<Task> runningTasks;
 	private final Map<String, Future<?>> taskFutureMap = Collections.synchronizedMap(new HashMap<>());
 
 	public TaskQueueHelper(ProxyProperties properties) {
 		ProxyProperties.TaskQueueConfig queueConfig = properties.getQueue();
-		this.timeoutMinutes = queueConfig.getTimeoutMinutes();
-		this.runningTasks = Collections.synchronizedList(new ArrayList<>(queueConfig.getCoreSize() * 2));
+		this.runningTasks = new CopyOnWriteArrayList<>();
 		this.taskExecutor = new ThreadPoolTaskExecutor();
 		this.taskExecutor.setCorePoolSize(queueConfig.getCoreSize());
 		this.taskExecutor.setMaxPoolSize(queueConfig.getCoreSize());
 		this.taskExecutor.setQueueCapacity(queueConfig.getQueueSize());
 		this.taskExecutor.setThreadNamePrefix("TaskQueue-");
 		this.taskExecutor.initialize();
-
-		this.waitFutureExecutor = new ThreadPoolTaskExecutor();
-		this.waitFutureExecutor.setCorePoolSize(queueConfig.getQueueSize());
-		this.waitFutureExecutor.setThreadNamePrefix("WaitFuture-");
-		this.waitFutureExecutor.initialize();
 	}
 
 	public Set<String> getQueueTaskIds() {
@@ -68,8 +59,12 @@ public class TaskQueueHelper {
 		return this.runningTasks.stream().filter(t -> id.equals(t.getId())).findFirst().orElse(null);
 	}
 
-	public Stream<Task> findRunningTask(TaskCondition condition) {
+	public Stream<Task> findRunningTask(Predicate<Task> condition) {
 		return this.runningTasks.stream().filter(condition);
+	}
+
+	public Future<?> getRunningFuture(String taskId) {
+		return this.taskFutureMap.get(taskId);
 	}
 
 	public SubmitResultVO submitTask(Task task, Callable<Message<Void>> discordSubmit) {
@@ -105,7 +100,6 @@ public class TaskQueueHelper {
 				return;
 			}
 			changeStatusAndNotify(task, TaskStatus.SUBMITTED);
-			waitTaskFuture(task);
 			do {
 				task.sleep();
 				changeStatusAndNotify(task, task.getStatus());
@@ -123,31 +117,7 @@ public class TaskQueueHelper {
 		}
 	}
 
-	private void waitTaskFuture(Task task) {
-		Future<?> future = this.taskFutureMap.get(task.getId());
-		if (future == null) {
-			task.fail("执行错误，系统异常");
-			changeStatusAndNotify(task, TaskStatus.FAILURE);
-			return;
-		}
-		this.waitFutureExecutor.execute(() -> {
-			try {
-				future.get(this.timeoutMinutes, TimeUnit.MINUTES);
-			} catch (TimeoutException e) {
-				if (Set.of(TaskStatus.FAILURE, TaskStatus.SUCCESS).contains(task.getStatus())) {
-					return;
-				}
-				future.cancel(true);
-				log.debug("task timeout, id: {}", task.getId());
-				task.fail("任务超时");
-				changeStatusAndNotify(task, TaskStatus.FAILURE);
-			} catch (Exception e) {
-				Thread.currentThread().interrupt();
-			}
-		});
-	}
-
-	private void changeStatusAndNotify(Task task, TaskStatus status) {
+	public void changeStatusAndNotify(Task task, TaskStatus status) {
 		task.setStatus(status);
 		this.taskStoreService.save(task);
 		this.notifyService.notifyTaskChange(task);
